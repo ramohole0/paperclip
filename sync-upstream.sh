@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 
-# Synchronize the current branch with the community repository, then publish it.
+# Synchronize the community repository into this fork's master branch.
 #
-# The two remotes have deliberately different roles:
+# The destination is always master, regardless of which branch invokes the
+# script. The two remotes have deliberately different roles:
 #   upstream  community repository used as the source of updates
-#   origin    this repository's fork, used as the push destination
+#   origin    this repository's fork, whose master branch is published
 #
-# The script requires a clean working tree so a merge cannot hide local work. It
-# never force-pushes or automatically resolves conflicts: merge conflicts remain
-# available for manual resolution, and a non-fast-forward push is safely rejected.
+# The script requires a clean working tree before switching branches. It never
+# force-pushes or automatically resolves conflicts: merge conflicts remain for
+# manual resolution, and a non-fast-forward push is safely rejected.
 #
 # Usage:
 #   ./sync-upstream.sh
@@ -20,6 +21,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$SCRIPT_DIR"
 SOURCE_REMOTE="upstream"
 PUSH_REMOTE="origin"
+TARGET_BRANCH="master"
 
 if [[ -t 1 && "${NO_COLOR:-}" == "" ]]; then
   COLOR_RESET=$'\033[0m'
@@ -76,8 +78,8 @@ usage() {
   printf '\n'
   printf '%b\n' "${COLOR_DIM}Usage:${COLOR_RESET} ./sync-upstream.sh [upstream-branch]"
   printf '\n'
-  printf '%s\n' "Fetch and merge the selected upstream branch into the current branch,"
-  printf '%s\n' "then push the current branch to the same branch name on origin."
+  printf '%s\n' "Switch to local master, update it from origin/master, merge the selected"
+  printf '%s\n' "community branch, and publish the result to origin/master."
   printf '\n'
   printf '%b\n' "${COLOR_DIM}Arguments:${COLOR_RESET}"
   printf '  %-22s %s\n' "upstream-branch" "Branch on upstream (default: upstream HEAD, then master)"
@@ -85,7 +87,7 @@ usage() {
   printf '%b\n' "${COLOR_DIM}Environment:${COLOR_RESET}"
   printf '  %-22s %s\n' "NO_COLOR=1" "Disable colored output"
   printf '\n'
-  printf '%s\n' "The push configures origin/<current-branch> as the tracking branch and never force-pushes."
+  printf '%s\n' "The destination is always origin/master and the script never force-pushes."
 }
 
 remote_exists() {
@@ -101,8 +103,8 @@ resolve_upstream_branch() {
     return
   fi
 
-  # Prefer the remote's configured default. Fresh or manually configured clones
-  # may not have this symbolic ref, so retain master as a compatibility fallback.
+  # Prefer the community remote's configured default. Fresh or manually
+  # configured clones may not have this symbolic ref, so master is the fallback.
   upstream_head="$(git symbolic-ref --quiet --short "refs/remotes/$SOURCE_REMOTE/HEAD" 2>/dev/null || true)"
   upstream_head="${upstream_head#${SOURCE_REMOTE}/}"
   if [[ -n "$upstream_head" ]]; then
@@ -114,7 +116,7 @@ resolve_upstream_branch() {
 
 main() {
   local requested_branch=""
-  local current_branch upstream_branch upstream_ref push_destination merge_result
+  local starting_branch upstream_branch upstream_ref origin_ref merge_result
 
   if [[ $# -gt 1 ]]; then
     usage >&2
@@ -133,56 +135,74 @@ main() {
     *) requested_branch="${1:-}" ;;
   esac
 
-  # Anchor all Git operations to this checkout, regardless of the caller's cwd.
+  # Anchor every Git operation to this checkout, regardless of the caller's cwd.
   cd "$REPO_ROOT"
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Repository not found at $REPO_ROOT"
 
-  current_branch="$(git branch --show-current)"
-  [[ -n "$current_branch" ]] || die "Detached HEAD is not supported; check out a branch first"
+  starting_branch="$(git branch --show-current)"
+  [[ -n "$starting_branch" ]] || die "Detached HEAD is not supported; check out a branch first"
 
-  # Fetching is harmless, but merging is not. Fail before any network or history
-  # operation when staged, unstaged, or untracked work could be mixed into it.
+  # The script may switch away from the caller's branch. Reject staged, unstaged,
+  # and untracked work first so checkout and merge cannot hide local changes.
   [[ -z "$(git status --porcelain)" ]] \
     || die "Working tree is not clean; commit or stash changes first"
 
   remote_exists "$SOURCE_REMOTE" || die "Remote '$SOURCE_REMOTE' does not exist"
   remote_exists "$PUSH_REMOTE" || die "Remote '$PUSH_REMOTE' does not exist"
+  git show-ref --verify --quiet "refs/heads/$TARGET_BRANCH" \
+    || die "Local branch '$TARGET_BRANCH' does not exist"
 
   upstream_branch="$(resolve_upstream_branch "$requested_branch")"
   upstream_ref="$SOURCE_REMOTE/$upstream_branch"
-  push_destination="$PUSH_REMOTE/$current_branch"
+  origin_ref="$PUSH_REMOTE/$TARGET_BRANCH"
 
-  info "Synchronizing community updates"
+  info "Synchronizing community updates into master"
+  print_summary_row "Started on" "$starting_branch"
   print_summary_row "Source" "$upstream_ref"
-  print_summary_row "Branch" "$current_branch"
-  print_summary_row "Publish" "$push_destination"
+  print_summary_row "Destination" "$origin_ref"
 
-  step "Fetching $upstream_ref"
+  if [[ "$starting_branch" != "$TARGET_BRANCH" ]]; then
+    step "Switching from $starting_branch to $TARGET_BRANCH"
+    git switch "$TARGET_BRANCH"
+  else
+    info "Already on $TARGET_BRANCH"
+  fi
+
+  # Refresh both remote-tracking branches. Updating local master from origin first
+  # preserves fork-only commits and prevents publishing from a stale local base.
+  step "Fetching $origin_ref and $upstream_ref"
+  git fetch "$PUSH_REMOTE" "$TARGET_BRANCH"
   git fetch "$SOURCE_REMOTE" "$upstream_branch"
+  git rev-parse --verify "${origin_ref}^{commit}" >/dev/null 2>&1 \
+    || die "Fetched branch '$origin_ref' does not resolve to a commit"
   git rev-parse --verify "${upstream_ref}^{commit}" >/dev/null 2>&1 \
     || die "Fetched branch '$upstream_ref' does not resolve to a commit"
 
+  step "Updating local $TARGET_BRANCH from $origin_ref"
+  # Only a fast-forward is accepted here. Diverged local and fork histories need
+  # explicit human reconciliation rather than an unexpected automatic merge.
+  git merge --ff-only "$origin_ref"
+
   if git merge-base --is-ancestor "$upstream_ref" HEAD; then
     merge_result="already included"
-    info "$upstream_ref is already included; no merge needed"
+    info "$upstream_ref is already included; no community merge needed"
   else
-    step "Merging $upstream_ref into $current_branch"
+    step "Merging $upstream_ref into $TARGET_BRANCH"
     # A failed merge intentionally leaves Git's normal conflict state intact.
     git merge --no-ff "$upstream_ref" -m "chore: sync $upstream_ref"
     merge_result="merge commit created"
   fi
 
-  # Continue here even when no merge was needed: the local synchronization may
-  # still be unpublished. The explicit refspec avoids relying on user push config,
-  # publishes this exact HEAD under the same branch name, and never force-pushes.
-  step "Pushing $current_branch to $push_destination"
-  git push --set-upstream "$PUSH_REMOTE" "HEAD:refs/heads/$current_branch"
+  # Publish this exact master HEAD to origin/master. The explicit refspec avoids
+  # user-specific push settings, and the absence of --force protects the remote.
+  step "Pushing $TARGET_BRANCH to $origin_ref"
+  git push --set-upstream "$PUSH_REMOTE" "HEAD:refs/heads/$TARGET_BRANCH"
 
-  success "Community version synchronized and published"
+  success "Community version synchronized to master"
   print_summary_row "Upstream" "$upstream_ref"
   print_summary_row "Merge" "$merge_result"
-  print_summary_row "Published" "$push_destination"
-  print_summary_row "Tracking" "$push_destination"
+  print_summary_row "Published" "$origin_ref"
+  print_summary_row "Current" "$TARGET_BRANCH"
 }
 
 main "$@"
