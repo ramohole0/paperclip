@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { runWithoutActiveStep } from "./acpx-engine/startup-timing.js";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
 import { preferredShellForSandbox, shellCommandArgs } from "./sandbox-shell.js";
 import type { RunProcessResult } from "./server-utils.js";
@@ -149,6 +150,11 @@ export interface SandboxCallbackBridgeDirectories {
 
 export interface SandboxCallbackBridgeQueueClient {
   makeDir(remotePath: string): Promise<void>;
+  // Optional batched directory create. The built-in clients create every
+  // queue directory in one remote exec. A client that predates this method
+  // omits it; the worker falls back to sequential `makeDir` calls, so an
+  // external implementation stays compatible without a change.
+  makeDirs?(remotePaths: string[]): Promise<void>;
   listJsonFiles(remotePath: string): Promise<string[]>;
   readTextFile(remotePath: string): Promise<string>;
   writeTextFile(remotePath: string, body: string): Promise<void>;
@@ -359,6 +365,11 @@ export function createFileSystemSandboxCallbackBridgeQueueClient(): SandboxCallb
     makeDir: async (remotePath) => {
       await fs.mkdir(remotePath, { recursive: true });
     },
+    makeDirs: async (remotePaths) => {
+      for (const remotePath of remotePaths) {
+        await fs.mkdir(remotePath, { recursive: true });
+      }
+    },
     listJsonFiles: async (remotePath) => {
       const entries = await fs.readdir(remotePath, { withFileTypes: true }).catch(() => []);
       return entries
@@ -469,6 +480,13 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
   return {
     makeDir: async (remotePath) => {
       await runChecked(`mkdir ${remotePath}`, `mkdir -p ${shellQuote(remotePath)}`);
+    },
+    makeDirs: async (remotePaths) => {
+      if (remotePaths.length === 0) {
+        return;
+      }
+      const quoted = remotePaths.map((remotePath) => shellQuote(remotePath));
+      await runChecked(`mkdir ${remotePaths.join(" ")}`, `mkdir -p ${quoted.join(" ")}`);
     },
     listJsonFiles: async (remotePath) => {
       const result = await runShell(
@@ -606,10 +624,21 @@ export async function startSandboxCallbackBridgeWorker(input: {
   const pollIntervalMs = normalizeTimeoutMs(input.pollIntervalMs, DEFAULT_BRIDGE_POLL_INTERVAL_MS);
   const maxBodyBytes = normalizeTimeoutMs(input.maxBodyBytes, DEFAULT_BRIDGE_MAX_BODY_BYTES);
   const directories = sandboxCallbackBridgeDirectories(input.queueDir);
-  await input.client.makeDir(directories.rootDir);
-  await input.client.makeDir(directories.requestsDir);
-  await input.client.makeDir(directories.responsesDir);
-  await input.client.makeDir(directories.logsDir);
+  const queueDirectories = [
+    directories.rootDir,
+    directories.requestsDir,
+    directories.responsesDir,
+    directories.logsDir,
+  ];
+  if (input.client.makeDirs) {
+    await input.client.makeDirs(queueDirectories);
+  } else {
+    // Backward-compatible fallback for a queue client that omits the batched
+    // makeDirs method. Create each queue directory with a single makeDir.
+    for (const directory of queueDirectories) {
+      await input.client.makeDir(directory);
+    }
+  }
 
   let stopping = false;
   let inFlight = 0;
@@ -717,7 +746,13 @@ export async function startSandboxCallbackBridgeWorker(input: {
     }
   };
 
-  const loop = (async () => {
+  // Start the long-lived poll loop outside the measured startup-step store.
+  // The `makeDir` calls above are startup work and must keep the active
+  // `bridge.paperclip` step. The loop runs run-time execs for the whole run,
+  // so each loop `sandbox.exec` span must not parent to the ended step or copy
+  // its `criticalPath` flag. `runWithoutActiveStep` empties the store for the
+  // loop only; Node keeps the empty store on every later poll continuation.
+  const loop = runWithoutActiveStep(() => (async () => {
     try {
       while (true) {
         const fileNames = await input.client.listJsonFiles(directories.requestsDir);
@@ -757,7 +792,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
         settleResolve();
       }
     }
-  })();
+  })());
 
   void loop;
 
